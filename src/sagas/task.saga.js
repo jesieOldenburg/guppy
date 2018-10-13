@@ -1,7 +1,7 @@
 // @flow
 import { select, call, put, take, takeEvery } from 'redux-saga/effects';
 import { eventChannel, END } from 'redux-saga';
-import { ipcRenderer } from 'electron';
+import { ipcRenderer, remote } from 'electron';
 import * as childProcess from 'child_process';
 import chalkRaw from 'chalk';
 
@@ -29,6 +29,7 @@ import {
 import type { Action } from 'redux';
 import type { Saga } from 'redux-saga';
 import type { Task, ProjectType } from '../types';
+const { dialog } = remote;
 
 const chalk = new chalkRaw.constructor({ level: 3 });
 
@@ -213,7 +214,17 @@ export function* taskRun({ task }: Action): Saga<void> {
     stderr: emitter => data => {
       const text = stripUnusableControlCharacters(data.toString());
 
-      emitter({ channel: 'stderr', text });
+      // When trying to eject, there will be an error from CRA if git state
+      // isn't clean. We can use this.
+      const uncleanRepo = text.includes(
+        'git repository has untracked files or uncommitted changes'
+      );
+
+      emitter({
+        channel: uncleanRepo === true ? 'exit' : 'stderr',
+        text,
+        uncleanRepo,
+      });
     },
     exit: emitter => code => {
       const timestamp = new Date();
@@ -225,6 +236,7 @@ export function* taskRun({ task }: Action): Saga<void> {
 
   while (true) {
     const message = yield take(stdioChannel);
+    const { uncleanRepo } = message;
 
     switch (message.channel) {
       case 'stdout':
@@ -237,23 +249,40 @@ export function* taskRun({ task }: Action): Saga<void> {
 
       case 'exit':
         if (task.name === 'eject') {
+          // If ejecting failed due to unclean repo, then throw up a dialog
+          if (uncleanRepo === true) {
+            dialog.showMessageBox({
+              type: 'warning',
+              buttons: ['Ok'],
+              defaultId: 0,
+              cancelId: 0,
+              title: 'Oops!',
+              message: 'Dirty git state detected',
+              detail:
+                'Oh no! In order to eject, git state must be clean. Please commit your changes to continue ejecting.',
+            });
+          }
+
           // Run a fresh install of dependencies after ejecting to get around issue
           // documented here https://github.com/facebook/create-react-app/issues/4433
-          const installProcess = yield call(
-            [childProcess, childProcess.spawn],
-            PACKAGE_MANAGER_CMD,
-            ['install'],
-            {
-              cwd: projectPath,
-              env: getBaseProjectEnvironment(projectPath),
-            }
-          );
+          // Only run if repo is clean (if eject didn't fail)
+          if (uncleanRepo === false) {
+            const installProcess = yield call(
+              [childProcess, childProcess.spawn],
+              PACKAGE_MANAGER_CMD,
+              ['install'],
+              {
+                cwd: projectPath,
+                env: getBaseProjectEnvironment(projectPath),
+              }
+            );
 
-          // `waitForChildProcessToComplete` waits for proper exit before moving on
-          // otherwise the next tasks (UI related) run too early before `yarn install`
-          // is finished
-          yield call(waitForChildProcessToComplete, installProcess);
-          yield put(loadDependencyInfoFromDisk(project.id, project.path));
+            // `waitForChildProcessToComplete` waits for proper exit before moving on
+            // otherwise the next tasks (UI related) run too early before `yarn install`
+            // is finished
+            yield call(waitForChildProcessToComplete, installProcess);
+            yield put(loadDependencyInfoFromDisk(project.id, project.path));
+          }
         }
 
         yield call(displayTaskComplete, task, message.wasSuccessful);
